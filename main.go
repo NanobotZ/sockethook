@@ -57,6 +57,11 @@ func handleHook(w http.ResponseWriter, r *http.Request, endpoint string) {
 				conn.Close()
 			}
 		}
+		
+		if len(conns) != 0 {
+			// Send 202-Accepted status code if sent to any client
+			w.WriteHeader(202)
+		}
 	}
 
 	clients[endpoint] = conns
