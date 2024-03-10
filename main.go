@@ -5,14 +5,23 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/gorilla/websocket"
-	log "github.com/sirupsen/logrus"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+	log "github.com/sirupsen/logrus"
 )
 
+type ConnMutex struct {
+	mu   sync.Mutex
+	conn *websocket.Conn
+}
+
 // Map holding all Websocket clients and the endpoints they are subscribed to
-var clients = make(map[string][]*websocket.Conn)
+var clients = make(map[string][]*ConnMutex)
+var clientsMu = sync.Mutex{}
 var upgrader = websocket.Upgrader{}
 
 // Message which will be sent as JSON to Websocket clients
@@ -20,6 +29,66 @@ type Message struct {
 	Headers  map[string]string `json:"headers"`
 	Endpoint string            `json:"endpoint"`
 	Data     interface{}       `json:"data"`
+}
+
+func removeConn(conn *ConnMutex, endpoint string, reason string) {
+	logEntry := log.WithField("endpoint", endpoint).WithField("reason", reason)
+
+	conns := clients[endpoint]
+	clientsMu.Lock()
+	for i, cm := range conns {
+		if cm == conn {
+			// Remove element from array
+			conns[i] = conns[len(conns)-1]
+			conns = conns[:len(conns)-1]
+			// Close connection
+			conn.conn.Close()
+
+			clients[endpoint] = conns
+			logEntry.WithField("clients", len(conns)).Infoln("Client disconnected")
+			break
+		}
+	}
+	clientsMu.Unlock()
+}
+
+func keepAlive(cm *ConnMutex, endpoint string, timeout time.Duration) {
+	lastResponse := time.Now()
+
+	cm.conn.SetCloseHandler(func(code int, text string) error {
+		removeConn(cm, endpoint, "disconnect")
+		return nil
+	})
+
+	go func() {
+		for {
+			cm.mu.Lock()
+			err := cm.conn.WriteMessage(websocket.TextMessage, []byte("heartbeat"))
+			cm.mu.Unlock()
+			if err != nil {
+				removeConn(cm, endpoint, "write message error: "+err.Error())
+				return
+			}
+
+			cm.conn.SetReadDeadline(time.Now().Add(timeout))
+			messageType, message, err := cm.conn.ReadMessage()
+			if err != nil {
+				removeConn(cm, endpoint, "read message timeout: "+err.Error())
+				return
+			}
+
+			if messageType == websocket.TextMessage && string(message) == "heartbeat" {
+				lastResponse = time.Now()
+			}
+
+			if time.Since(lastResponse) > timeout {
+				removeConn(cm, endpoint, "heartbeat timeout")
+				return
+			}
+
+			time.Sleep(timeout)
+		}
+	}()
 }
 
 func handleHook(w http.ResponseWriter, r *http.Request, endpoint string) {
@@ -50,27 +119,27 @@ func handleHook(w http.ResponseWriter, r *http.Request, endpoint string) {
 	conns := clients[endpoint]
 
 	if conns != nil {
-		for i, conn := range conns {
-			if conn.WriteJSON(msg) != nil {
-				// Remove client and close connection if sending failed
-				conns = append(conns[:i], conns[i+1:]...)
-				conn.Close()
-			}
-		}
-		
 		if len(conns) != 0 {
+			clientsMu.Lock()
+			for _, cm := range conns {
+				cm.mu.Lock()
+				cm.conn.WriteJSON(msg)
+				cm.mu.Unlock()
+			}
+			clientsMu.Unlock()
+
 			// Send 202-Accepted status code if sent to any client
 			w.WriteHeader(202)
 		}
 	}
-
-	clients[endpoint] = conns
 
 	logEntry.WithField("clients", len(conns)).Infoln("Hook broadcasted")
 }
 
 func handleClient(w http.ResponseWriter, r *http.Request, endpoint string) {
 	conn, err := upgrader.Upgrade(w, r, nil)
+	cm := ConnMutex{conn: conn}
+
 	logEntry := log.WithField("endpoint", endpoint)
 
 	if err != nil {
@@ -80,10 +149,13 @@ func handleClient(w http.ResponseWriter, r *http.Request, endpoint string) {
 		return
 	}
 
+	// Ensure connection is kept alive
+	keepAlive(&cm, endpoint, time.Second*30)
 	// Add client to endpoint slice
-	clients[endpoint] = append(clients[endpoint], conn)
-
+	clientsMu.Lock()
+	clients[endpoint] = append(clients[endpoint], &cm)
 	logEntry.WithField("clients", len(clients[endpoint])).Infoln("Client connected")
+	clientsMu.Unlock()
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
